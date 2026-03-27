@@ -7,6 +7,14 @@ from app.services.embedder import Embedder
 
 
 class ChromaIngestor:
+    _default_max_batch_size = 5000
+    _allowed_collection_names = {"nx2meapp", "kinexushhd"}
+    _app_aliases = {
+        "nx2me": "Nx2meApp",
+        "nx2meapp": "Nx2meApp",
+        "kinexushhd": "kinexushhd",
+    }
+
     def __init__(self):
         self.client = get_chroma_client()
         self.embedding = Embedder().get_embedding_function()
@@ -15,7 +23,8 @@ class ChromaIngestor:
         if not chunks:
             raise RuntimeError("No chunks were provided for ChromaDB ingestion.")
 
-        app_name = str(chunks[0].get("app") or "app")
+        self._clear_all_collections()
+        app_name = self._normalize_app_name(chunks[0].get("app") or "app")
         self._ingest_collection(self._build_collection_name(app_name), chunks, replace=True)
         persist_client(self.client)
 
@@ -28,38 +37,52 @@ class ChromaIngestor:
         if not app_directories:
             raise RuntimeError(f"No processed application folders were found in: {processed_path}")
 
+        self._clear_all_collections()
         ingested_collections = []
         for app_dir in app_directories:
             chunks = self._load_app_chunks(app_dir)
             if not chunks:
                 continue
 
-            app_name = str(chunks[0].get("app") or app_dir.name)
+            app_name = self._normalize_app_name(chunks[0].get("app") or app_dir.name)
             collection_name = self._build_collection_name(app_name)
+            if collection_name not in self._allowed_collection_names:
+                continue
             self._ingest_collection(collection_name, chunks, replace=True)
             ingested_collections.append(collection_name)
 
         persist_client(self.client)
         return ingested_collections
 
-    def _replace_documents(self, collection):
+    def _clear_all_collections(self):
         try:
-            existing = collection.get()
+            collections = self.client.list_collections()
         except Exception:
-            existing = {"ids": []}
+            return
 
-        existing_ids = existing.get("ids") or []
-        if existing_ids:
-            collection.delete(ids=existing_ids)
+        for collection in collections:
+            collection_name = collection if isinstance(collection, str) else getattr(collection, "name", "")
+            if not collection_name:
+                continue
+            try:
+                self.client.delete_collection(name=collection_name)
+            except Exception:
+                pass
+
+    def _reset_collection(self, collection_name):
+        try:
+            self.client.delete_collection(name=collection_name)
+        except Exception:
+            pass
 
     def _ingest_collection(self, collection_name, chunks, replace):
+        if replace:
+            self._reset_collection(collection_name)
+
         collection = self.client.get_or_create_collection(
             name=collection_name,
             embedding_function=self.embedding,
         )
-
-        if replace:
-            self._replace_documents(collection)
 
         documents = []
         metadatas = []
@@ -80,11 +103,28 @@ class ChromaIngestor:
             return
 
         try:
-            collection.add(documents=documents, metadatas=metadatas, ids=ids)
+            max_batch_size = self._get_max_batch_size(collection)
+            for start in range(0, len(documents), max_batch_size):
+                stop = start + max_batch_size
+                collection.add(
+                    documents=documents[start:stop],
+                    metadatas=metadatas[start:stop],
+                    ids=ids[start:stop],
+                )
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to ingest documents into ChromaDB collection '{collection_name}'."
             ) from exc
+
+    def _get_max_batch_size(self, collection):
+        try:
+            max_batch_size = int(collection._client.get_max_batch_size())
+            if max_batch_size > 0:
+                return max_batch_size
+        except Exception:
+            pass
+
+        return self._default_max_batch_size
 
     def _load_app_chunks(self, app_dir):
         chunks = []
@@ -99,7 +139,7 @@ class ChromaIngestor:
 
     def _build_metadata(self, chunk):
         metadata = {
-            "app": str(chunk.get("app") or "unknown"),
+            "app": self._normalize_app_name(chunk.get("app") or "unknown"),
             "domain": str(chunk.get("domain") or "general"),
             "type": str(chunk.get("type") or "text"),
             "section": str(chunk.get("section") or "general"),
@@ -139,6 +179,11 @@ class ChromaIngestor:
 
     def _build_collection_name(self, app_name):
         return self._slugify(app_name or "app")
+
+    def _normalize_app_name(self, app_name):
+        raw_name = str(app_name or "").strip()
+        key = self._slugify(raw_name)
+        return self._app_aliases.get(key, raw_name or "app")
 
     def _slugify(self, value):
         slug = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")

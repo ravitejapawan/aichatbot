@@ -22,6 +22,7 @@ from app.services.chroma_admin import (
     list_collections,
 )
 from app.services.feedback_store import FeedbackStore
+from app.services.image_selector import KnowledgeImageSelector
 
 
 def _warm_local_services():
@@ -57,6 +58,7 @@ app.mount(
 
 rag = RAGPipeline()
 feedback_store = FeedbackStore()
+image_selector = KnowledgeImageSelector()
 
 
 def _slugify(value: str) -> str:
@@ -290,7 +292,7 @@ def kb_page_snapshot(collection: str, page: int, zoom: float = 1.7):
 
 
 @app.get("/kb-figures/{collection}/{page}")
-def kb_figure_snapshot(collection: str, page: int, section: str = "", zoom: float = 2.2):
+def kb_figure_snapshot(collection: str, page: int, section: str = "", context: str = "", zoom: float = 2.2):
     if page < 1:
       raise HTTPException(status_code=400, detail="Page must be >= 1.")
     if zoom <= 0 or zoom > 4:
@@ -305,7 +307,36 @@ def kb_figure_snapshot(collection: str, page: int, section: str = "", zoom: floa
 
     try:
       with fitz.open(pdf_path) as document:
-        match = _find_best_figure_region(document, page=page, section=section)
+        selected_figure = image_selector.select_figure(
+          collection=collection,
+          pdf_path=pdf_path,
+          page=page,
+          section=section,
+          context=context,
+          use_model=False,
+        )
+        if selected_figure:
+          target_page = int(selected_figure["page"])
+          clip_rect = fitz.Rect(selected_figure["clip_rect"])
+          pdf_page = document.load_page(target_page - 1)
+          clip_rect = clip_rect & pdf_page.rect
+          pixmap = pdf_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip_rect, alpha=False)
+          return Response(content=pixmap.tobytes("png"), media_type="image/png")
+
+        selected_image = image_selector.select_image(
+          collection=collection,
+          page=page,
+          section=section,
+          use_model=False,
+        )
+        if selected_image:
+          image_path = Path(selected_image["image_path"])
+          return Response(
+            content=image_path.read_bytes(),
+            media_type=selected_image["media_type"],
+          )
+
+        match = _find_best_figure_region(document, page=page, section=section or context)
         if match:
           target_page, clip_rect = match
           pdf_page = document.load_page(target_page - 1)

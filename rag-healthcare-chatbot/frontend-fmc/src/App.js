@@ -136,6 +136,7 @@ const App = () => {
   const [feedbackLoadingById, setFeedbackLoadingById] = useState({});
   const [failedImageUrls, setFailedImageUrls] = useState({});
   const [error, setError] = useState("");
+  const [introAnimationFailed, setIntroAnimationFailed] = useState(false);
   const streamAbortControllerRef = useRef(null);
   const introAnimationRef = useRef(null);
   const chatScrollContainerRef = useRef(null);
@@ -168,23 +169,49 @@ const App = () => {
   }, []);
 
   useEffect(() => {
-    if (!introAnimationRef.current) return undefined;
+    if (messages.length !== 0 || !introAnimationRef.current) return undefined;
 
-    const animation = lottie.loadAnimation({
-      container: introAnimationRef.current,
-      renderer: 'svg',
-      loop: true,
-      autoplay: true,
-      path: `${process.env.PUBLIC_URL || ''}/live-chatbot.json`,
-      rendererSettings: {
-        preserveAspectRatio: 'xMidYMid meet',
-      },
-    });
+    let isCancelled = false;
+    let animationInstance;
+
+    const loadIntroAnimation = async () => {
+      try {
+        setIntroAnimationFailed(false);
+        const response = await fetch(`${process.env.PUBLIC_URL || ''}/live-chatbot.json`);
+        if (!response.ok) {
+          throw new Error(`Failed to load intro animation: ${response.status}`);
+        }
+
+        const animationData = await response.json();
+        if (isCancelled || !introAnimationRef.current) return;
+
+        animationInstance = lottie.loadAnimation({
+          container: introAnimationRef.current,
+          renderer: 'svg',
+          loop: true,
+          autoplay: true,
+          animationData,
+          rendererSettings: {
+            preserveAspectRatio: 'xMidYMid meet',
+          },
+        });
+      } catch (animationError) {
+        console.error(animationError);
+        if (!isCancelled) {
+          setIntroAnimationFailed(true);
+        }
+      }
+    };
+
+    loadIntroAnimation();
 
     return () => {
-      animation.destroy();
+      isCancelled = true;
+      if (animationInstance) {
+        animationInstance.destroy();
+      }
     };
-  }, []);
+  }, [messages.length]);
 
   useEffect(() => {
     const container = chatScrollContainerRef.current;
@@ -475,22 +502,20 @@ const App = () => {
   const handleFollowUpAction = async (message, action) => {
     if (!message || isSending) return;
 
-    const section = String(message?.sources?.[0]?.section || '').trim();
     if (action === 'details') {
-      await sendMessage(
-        section
-          ? `Please provide a detailed walkthrough from the documents for "${section}".`
-          : 'Please provide a detailed walkthrough from the documents.'
-      );
+      await sendMessage('Please provide a detailed walkthrough from the documents.');
       return;
     }
 
-    await sendMessage(
-      section
-        ? `Please show reference images for "${section}".`
-        : 'Please show reference images related to this answer.'
-      , { showImages: true }
-    );
+    await sendMessage('Please show reference images related to this answer.', { showImages: true });
+  };
+
+  const buildFigureContextParam = (source) => {
+    const raw = String(source?.text || '').replace(/\s+/g, ' ').trim();
+    if (!raw) {
+      return '';
+    }
+    return encodeURIComponent(raw.slice(0, 220));
   };
 
   const getRenderableImageSources = (message) => {
@@ -501,6 +526,31 @@ const App = () => {
 
     const seen = new Set();
     const renderable = [];
+
+    for (const source of sources) {
+      const page = Number(source?.page);
+      const collection = String(source?.collection || message?.collection || '').trim();
+      if (!collection || !Number.isFinite(page) || page < 1) {
+        continue;
+      }
+
+      const section = encodeURIComponent(String(source?.section || ''));
+      const context = buildFigureContextParam(source);
+      const query = context ? `?section=${section}&context=${context}` : `?section=${section}`;
+      const figureUrl = `${API_BASE_URL}/kb-figures/${encodeURIComponent(collection)}/${page}${query}`;
+      if (seen.has(figureUrl)) {
+        continue;
+      }
+      seen.add(figureUrl);
+      renderable.push({
+        url: figureUrl,
+        section: source?.section || `Page ${page}`,
+        page,
+      });
+      if (renderable.length >= 1) {
+        return renderable;
+      }
+    }
 
     for (const source of sources) {
       const imageUrl = String(source?.image_url || '').trim();
@@ -517,35 +567,13 @@ const App = () => {
       }
       seen.add(absoluteUrl);
       renderable.push({
-        url: absoluteUrl,
-        section: source?.section || 'Reference image',
-        page: source?.page,
+          url: absoluteUrl,
+          section: source?.section || 'Reference image',
+          page: source?.page,
       });
-    }
-
-    if (renderable.length) {
-      return renderable.slice(0, 2);
-    }
-
-    for (const source of sources) {
-      const page = Number(source?.page);
-      const collection = String(source?.collection || message?.collection || '').trim();
-      if (!collection || !Number.isFinite(page) || page < 1) {
-        continue;
+      if (renderable.length >= 1) {
+        return renderable;
       }
-
-      const section = encodeURIComponent(String(source?.section || ''));
-      const figureUrl = `${API_BASE_URL}/kb-figures/${encodeURIComponent(collection)}/${page}?section=${section}`;
-      if (seen.has(figureUrl)) {
-        continue;
-      }
-      seen.add(figureUrl);
-      renderable.push({
-        url: figureUrl,
-        section: source?.section || `Page ${page}`,
-        page,
-      });
-      break;
     }
 
     return renderable;
@@ -553,6 +581,7 @@ const App = () => {
 
   const shouldRenderImagesForMessage = (message, index, allMessages) => {
     if (!message || message.sender !== 'ai') return false;
+    if (!message.isComplete || !String(message.text || '').trim()) return false;
     if (message.showImages === true) return true;
     if (message.showImages === false) return false;
 
@@ -964,11 +993,19 @@ const App = () => {
                   {messages.length === 0 ? (
                     <div className="mt-16 text-center space-y-4 max-w-xl">
                       <div className="mx-auto mb-6 flex justify-center">
-                        <div
-                          ref={introAnimationRef}
-                          aria-hidden="true"
-                          className="h-[280px] w-[280px]"
-                        />
+                        {introAnimationFailed ? (
+                          <img
+                            src={`${process.env.PUBLIC_URL || ''}/botlogo.png`}
+                            alt="KinexAssist"
+                            className="h-[180px] w-auto object-contain"
+                          />
+                        ) : (
+                          <div
+                            ref={introAnimationRef}
+                            aria-hidden="true"
+                            className="h-[280px] w-[280px]"
+                          />
+                        )}
                       </div>
                       <h2 className="text-[32px] font-bold text-gray-800">
                         Hello
@@ -1102,7 +1139,8 @@ const App = () => {
                                       src={item.url}
                                       alt={item.section}
                                       className="w-full max-h-[360px] object-contain bg-white"
-                                      loading="lazy"
+                                      loading="eager"
+                                      fetchPriority="high"
                                       onError={() => handleImageLoadError(item.url)}
                                     />
                                     <div className="flex items-center justify-between px-2 py-1 text-[11px] text-gray-500">

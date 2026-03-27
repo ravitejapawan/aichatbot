@@ -226,6 +226,14 @@ function App() {
       minute: "2-digit",
     }).format(new Date(value));
 
+  const buildFigureContextParam = (source) => {
+    const raw = String(source?.text || "").replace(/\s+/g, " ").trim();
+    if (!raw) {
+      return "";
+    }
+    return encodeURIComponent(raw.slice(0, 220));
+  };
+
   const getRenderableImageSources = (sources) => {
     if (!Array.isArray(sources) || !sources.length) {
       return [];
@@ -233,6 +241,32 @@ function App() {
 
     const seen = new Set();
     const renderable = [];
+
+    for (const source of sources) {
+      const page = Number(source?.page);
+      const collection = String(source?.collection || "").trim();
+      if (!collection || !Number.isFinite(page) || page < 1) {
+        continue;
+      }
+
+      const section = encodeURIComponent(String(source?.section || ""));
+      const context = buildFigureContextParam(source);
+      const query = context ? `?section=${section}&context=${context}` : `?section=${section}`;
+      const url = `http://127.0.0.1:8000/kb-figures/${encodeURIComponent(collection)}/${page}${query}`;
+      if (seen.has(url)) {
+        continue;
+      }
+      seen.add(url);
+
+      renderable.push({
+        url,
+        section: source?.section || `Page ${page}`,
+        page,
+      });
+      if (renderable.length >= 1) {
+        return renderable;
+      }
+    }
 
     for (const source of sources) {
       const imageUrl = String(source?.image_url || "").trim();
@@ -254,35 +288,30 @@ function App() {
         section: source?.section || "Reference image",
         page: source?.page,
       });
-    }
-
-    if (renderable.length) {
-      return renderable.slice(0, 2);
-    }
-
-    for (const source of sources) {
-      const page = Number(source?.page);
-      const collection = String(source?.collection || "").trim();
-      if (!collection || !Number.isFinite(page) || page < 1) {
-        continue;
+      if (renderable.length >= 1) {
+        return renderable;
       }
-
-      const section = encodeURIComponent(String(source?.section || ""));
-      const url = `http://127.0.0.1:8000/kb-figures/${encodeURIComponent(collection)}/${page}?section=${section}`;
-      if (seen.has(url)) {
-        continue;
-      }
-      seen.add(url);
-
-      renderable.push({
-        url,
-        section: source?.section || `Page ${page}`,
-        page,
-      });
-      break;
     }
 
     return renderable;
+  };
+
+  const shouldRenderImagesForMessage = (message, index, allMessages) => {
+    if (!message || message.role !== "bot") return false;
+    if (!message.isComplete || !String(message.text || "").trim()) return false;
+
+    const sourceQuestion = String(message.sourceQuestion || "").toLowerCase();
+    if (sourceQuestion.includes("show reference images") || sourceQuestion.includes("image")) {
+      return true;
+    }
+
+    const previous = index > 0 ? allMessages[index - 1] : null;
+    const previousText = String(previous?.text || "").toLowerCase();
+    return previous?.role === "user" && (
+      previousText.includes("show reference images") ||
+      previousText.includes("show images") ||
+      previousText.includes("show image")
+    );
   };
 
   const submitFeedback = async (message, feedback) => {
@@ -593,6 +622,7 @@ function App() {
             ) : (
               messages.map((m, i) => {
                 const imageSources = getRenderableImageSources(m.sources);
+                const shouldRenderImages = shouldRenderImagesForMessage(m, i, messages);
 
                 return (
                   <div
@@ -609,11 +639,11 @@ function App() {
                     </div>
                     <div className="message-bubble">
                       {m.text}
-                      {m.role === "bot" && imageSources.length ? (
+                      {m.role === "bot" && shouldRenderImages && imageSources.length ? (
                         <div className="source-image-grid" aria-label="Reference images">
                           {imageSources.map((item) => (
                             <figure key={item.url} className="source-image-card">
-                              <img src={item.url} alt={item.section} loading="lazy" />
+                              <img src={item.url} alt={item.section} loading="eager" fetchPriority="high" />
                               <figcaption>
                                 <span>{item.section}</span>
                                 {item.page ? <span>Page {item.page}</span> : null}
